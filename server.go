@@ -3,7 +3,9 @@ package mbserver
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
@@ -115,11 +117,13 @@ type ModbusServer struct {
 	// MaxClients sets the maximum number of concurrent client connections
 	MaxClients  uint
 	logger      LeveledLogger
-	lock        sync.Mutex
+	mu          sync.Mutex
 	handler     RequestHandler
-	tcpListener net.Listener
-	tcpClients  []net.Conn
+	udpListener *net.UDPConn
+	udpClients  map[*net.UDPAddr]*udpTransport
 }
+
+type handler func([]byte)
 
 type Option func(*ModbusServer) error
 
@@ -152,9 +156,10 @@ func MaxClients(max uint) func(*ModbusServer) error {
 // interface.
 func New(reqHandler RequestHandler, opts ...Option) (*ModbusServer, error) {
 	ms := &ModbusServer{
-		Timeout: 30 * time.Second,
-		handler: reqHandler,
-		logger:  newLogger("modbus-server"),
+		Timeout:    30 * time.Second,
+		handler:    reqHandler,
+		logger:     newLogger("modbus-server"),
+		udpClients: make(map[*net.UDPAddr]*udpTransport),
 	}
 
 	for _, o := range opts {
@@ -167,38 +172,38 @@ func New(reqHandler RequestHandler, opts ...Option) (*ModbusServer, error) {
 }
 
 // Starts accepting client connections.
-func (ms *ModbusServer) Start(l net.Listener) error {
-	ms.lock.Lock()
-	defer ms.lock.Unlock()
+func (ms *ModbusServer) Start(l *net.UDPConn) error {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
 
-	if ms.tcpListener != nil {
+	if ms.udpListener != nil {
 		return errors.New("already started")
 	}
-	ms.tcpListener = l
+	ms.udpListener = l
 
-	go ms.acceptTCPClients()
+	go ms.acceptUdpClients()
 
 	return nil
 }
 
 // Stops accepting new client connections and closes any active session.
 func (ms *ModbusServer) Stop() (err error) {
-	ms.lock.Lock()
-	defer ms.lock.Unlock()
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
 
-	if ms.tcpListener == nil {
+	if ms.udpListener == nil {
 		return errors.New("not started")
 	}
 
 	// close the server socket if we're listening over TCP
-	err = ms.tcpListener.Close()
+	err = ms.udpListener.Close()
 
 	// close all active TCP clients
-	for _, sock := range ms.tcpClients {
-		sock.Close()
-	}
+	// for _, sock := range ms.udpClients {
+	// 	sock.Close()
+	// }
 
-	ms.tcpListener = nil
+	ms.udpListener = nil
 
 	return
 }
@@ -206,44 +211,48 @@ func (ms *ModbusServer) Stop() (err error) {
 // Accepts new client connections if the configured connection limit allows it.
 // Each connection is served from a dedicated goroutine to allow for concurrent
 // connections.
-func (ms *ModbusServer) acceptTCPClients() {
-	var sock net.Conn
-	var err error
-	var accepted bool
+func (ms *ModbusServer) acceptUdpClients() {
+	buffer := make([]byte, 1024)
 
 	for {
-		sock, err = ms.tcpListener.Accept()
+		n, addr, err := ms.udpListener.ReadFromUDP(buffer)
+		fmt.Println("-> ", string(buffer[0:n]), n)
+
 		if err != nil {
+			fmt.Println(err)
+
 			// if the server has just been stopped, return here
-			ms.lock.Lock()
-			if ms.tcpListener == nil {
-				ms.lock.Unlock()
+			ms.mu.Lock()
+			if ms.udpListener == nil {
+				ms.mu.Unlock()
 				return
 			}
-			ms.lock.Unlock()
+			ms.mu.Unlock()
 			ms.logger.Warningf("failed to accept client connection: %v", err)
 			continue
 		}
 
-		ms.lock.Lock()
-		// apply a connection limit
-		if ms.MaxClients == 0 || uint(len(ms.tcpClients)) < ms.MaxClients {
-			accepted = true
-			// add the new client connection to the pool
-			ms.tcpClients = append(ms.tcpClients, sock)
-		} else {
-			accepted = false
+		if strings.TrimSpace(string(buffer[0:n])) == "STOP" {
+			fmt.Println("Exiting UDP server!")
+			return
 		}
-		ms.lock.Unlock()
 
-		if accepted {
-			// spin a client handler goroutine to serve the new client
-			go ms.handleTCPClient(sock)
-		} else {
-			ms.logger.Warningf("max. number of concurrent connections reached, rejecting %v", sock.RemoteAddr())
-			// discard the connection
-			sock.Close()
+		ms.mu.Lock()
+		handler, ok := ms.udpClients[addr]
+		if !ok {
+			if ms.MaxClients == 0 || uint(len(ms.udpClients)) < ms.MaxClients {
+				handler = newUDPTransport(ms.udpListener, addr, ms.Timeout)
+				ms.udpClients[addr] = handler
+			} else {
+				continue
+			}
 		}
+		ms.mu.Unlock()
+
+		// fmt.Println("handle")
+		// pdu, err := handler.HandleRequest(buffer[0:n])
+
+		ms.handleTransport(handler, buffer[0:n])
 	}
 }
 
@@ -251,30 +260,30 @@ func (ms *ModbusServer) acceptTCPClients() {
 // Once handleTransport() returns (i.e. the connection has either closed, timed
 // out, or an unrecoverable error happened), the TCP socket is closed and removed
 // from the list of active client connections.
-func (ms *ModbusServer) handleTCPClient(sock net.Conn) {
-	ms.handleTransport(newTCPTransport(sock, ms.Timeout), sock.RemoteAddr().String())
+// func (ms *ModbusServer) handleUDPClient(sock *net.UDPAddr) {
+// 	ms.handleTransport(newUDPTransport(sock, ms.Timeout), sock.RemoteAddr().String())
 
-	// once done, remove our connection from the list of active client conns
-	ms.lock.Lock()
-	for i := range ms.tcpClients {
-		if ms.tcpClients[i] == sock {
-			ms.tcpClients[i] = ms.tcpClients[len(ms.tcpClients)-1]
-			ms.tcpClients = ms.tcpClients[:len(ms.tcpClients)-1]
-			break
-		}
-	}
-	ms.lock.Unlock()
+// 	// once done, remove our connection from the list of active client conns
+// 	ms.mu.Lock()
+// 	for i := range ms.udpClients {
+// 		if ms.udpClients[i] == sock {
+// 			ms.udpClients[i] = ms.udpClients[len(ms.udpClients)-1]
+// 			ms.udpClients = ms.udpClients[:len(ms.udpClients)-1]
+// 			break
+// 		}
+// 	}
+// 	ms.mu.Unlock()
 
-	// close the connection
-	sock.Close()
-}
+// 	// close the connection
+// 	sock.Close()
+// }
 
 // For each request read from the transport, performs decoding and validation,
 // calls the user-provided handler, then encodes and writes the response
 // to the transport.
-func (ms *ModbusServer) handleTransport(t transport, clientAddr string) {
+func (ms *ModbusServer) handleTransport(t transport, b []byte, clientAddr string) {
 	for {
-		req, err := t.ReadRequest()
+		req, err := t.HandleRequest(b)
 		if err != nil {
 			return
 		}
@@ -309,20 +318,20 @@ func (ms *ModbusServer) handleTransport(t transport, clientAddr string) {
 			// invoke the appropriate handler
 			if req.functionCode == fcReadCoils {
 				coils, err = ms.handler.HandleCoils(&CoilsRequest{
-					ClientAddr: clientAddr,
-					UnitId:     req.unitId,
-					Addr:       addr,
-					Quantity:   quantity,
-					IsWrite:    false,
-					Args:       nil,
+					// ClientAddr: clientAddr,
+					UnitId:   req.unitId,
+					Addr:     addr,
+					Quantity: quantity,
+					IsWrite:  false,
+					Args:     nil,
 				})
 			} else {
 				coils, err = ms.handler.HandleDiscreteInputs(
 					&DiscreteInputsRequest{
-						ClientAddr: clientAddr,
-						UnitId:     req.unitId,
-						Addr:       addr,
-						Quantity:   quantity,
+						// ClientAddr: clientAddr,
+						UnitId:   req.unitId,
+						Addr:     addr,
+						Quantity: quantity,
 					})
 			}
 			resCount = len(coils)
@@ -373,12 +382,12 @@ func (ms *ModbusServer) handleTransport(t transport, clientAddr string) {
 			// invoke the coil handler
 			_, err = ms.handler.HandleCoils(&CoilsRequest{
 				WriteFuncCode: fcWriteSingleCoil,
-				ClientAddr:    clientAddr,
-				UnitId:        req.unitId,
-				Addr:          addr,
-				Quantity:      1,    // request for a single coil
-				IsWrite:       true, // this is a write request
-				Args:          []bool{(req.payload[2] == 0xff)},
+				// ClientAddr:    clientAddr,
+				UnitId:   req.unitId,
+				Addr:     addr,
+				Quantity: 1,    // request for a single coil
+				IsWrite:  true, // this is a write request
+				Args:     []bool{(req.payload[2] == 0xff)},
 			})
 
 			if err != nil {
@@ -438,12 +447,12 @@ func (ms *ModbusServer) handleTransport(t transport, clientAddr string) {
 			// invoke the coil handler
 			_, err = ms.handler.HandleCoils(&CoilsRequest{
 				WriteFuncCode: fcWriteMultipleCoils,
-				ClientAddr:    clientAddr,
-				UnitId:        req.unitId,
-				Addr:          addr,
-				Quantity:      quantity,
-				IsWrite:       true, // this is a write request
-				Args:          decodeBools(quantity, req.payload[5:]),
+				// ClientAddr:    clientAddr,
+				UnitId:   req.unitId,
+				Addr:     addr,
+				Quantity: quantity,
+				IsWrite:  true, // this is a write request
+				Args:     decodeBools(quantity, req.payload[5:]),
 			})
 
 			if err != nil {
@@ -488,20 +497,20 @@ func (ms *ModbusServer) handleTransport(t transport, clientAddr string) {
 			if req.functionCode == fcReadHoldingRegisters {
 				regs, err = ms.handler.HandleHoldingRegisters(
 					&HoldingRegistersRequest{
-						ClientAddr: clientAddr,
-						UnitId:     req.unitId,
-						Addr:       addr,
-						Quantity:   quantity,
-						IsWrite:    false,
-						Args:       nil,
+						// ClientAddr: clientAddr,
+						UnitId:   req.unitId,
+						Addr:     addr,
+						Quantity: quantity,
+						IsWrite:  false,
+						Args:     nil,
 					})
 			} else {
 				regs, err = ms.handler.HandleInputRegisters(
 					&InputRegistersRequest{
-						ClientAddr: clientAddr,
-						UnitId:     req.unitId,
-						Addr:       addr,
-						Quantity:   quantity,
+						// ClientAddr: clientAddr,
+						UnitId:   req.unitId,
+						Addr:     addr,
+						Quantity: quantity,
 					})
 			}
 			resCount = len(regs)
@@ -544,12 +553,12 @@ func (ms *ModbusServer) handleTransport(t transport, clientAddr string) {
 			_, err = ms.handler.HandleHoldingRegisters(
 				&HoldingRegistersRequest{
 					WriteFuncCode: fcWriteSingleRegister,
-					ClientAddr:    clientAddr,
-					UnitId:        req.unitId,
-					Addr:          addr,
-					Quantity:      1,    // request for a single register
-					IsWrite:       true, // request is a write
-					Args:          []uint16{value},
+					// ClientAddr:    clientAddr,
+					UnitId:   req.unitId,
+					Addr:     addr,
+					Quantity: 1,    // request for a single register
+					IsWrite:  true, // request is a write
+					Args:     []uint16{value},
 				})
 
 			if err != nil {
@@ -605,12 +614,12 @@ func (ms *ModbusServer) handleTransport(t transport, clientAddr string) {
 			_, err = ms.handler.HandleHoldingRegisters(
 				&HoldingRegistersRequest{
 					WriteFuncCode: fcWriteMultipleRegisters,
-					ClientAddr:    clientAddr,
-					UnitId:        req.unitId,
-					Addr:          addr,
-					Quantity:      quantity,
-					IsWrite:       true, // this is a write request
-					Args:          bytesToUint16(binary.BigEndian, req.payload[5:]),
+					// ClientAddr:    clientAddr,
+					UnitId:   req.unitId,
+					Addr:     addr,
+					Quantity: quantity,
+					IsWrite:  true, // this is a write request
+					Args:     bytesToUint16(binary.BigEndian, req.payload[5:]),
 				})
 			if err != nil {
 				break
