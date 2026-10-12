@@ -2,6 +2,9 @@ package mbserver
 
 import "fmt"
 
+// maximum PDU size (253 bytes) minus the function code
+const maxPDUPayloadLength int = 252
+
 type pdu struct {
 	unitId       uint8
 	functionCode uint8

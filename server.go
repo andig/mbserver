@@ -107,6 +107,45 @@ type RequestHandler interface {
 	HandleInputRegisters(*InputRegistersRequest) ([]uint16, error)
 }
 
+// Request object passed to the raw handler.
+type RawRequest struct {
+	ClientAddr   string // the source (client) IP address
+	UnitId       uint8  // the requested unit id (slave id)
+	FunctionCode uint8  // the function code of the request
+	Payload      []byte // the request PDU without the function code
+}
+
+// The RawRequestHandler interface may optionally be implemented by the
+// handler object passed to New(), in addition to RequestHandler.
+// Requests with function codes the server does not handle itself are then
+// passed to HandleRaw instead of being rejected with an illegal function
+// exception. This allows forwarding vendor specific function codes to a
+// downstream device.
+type RawRequestHandler interface {
+	// HandleRaw handles requests with function codes not covered by
+	// RequestHandler, within the valid request range 0x01 to 0x7f.
+	// A RawRequest object is passed to the handler (see above).
+	//
+	// Expected return values:
+	// - functionCode:	the function code of the response. Must be the request
+	//			function code, or the request function code with the
+	//			error bit (0x80) set to pass through an exception response,
+	// - payload:		the response PDU without the function code: at most
+	//			252 bytes, or exactly one exception code byte for an
+	//			exception response,
+	// - err:		either nil if no error occurred, a modbus error (see
+	//			mapErrorToExceptionCode() in modbus.go for a complete list),
+	//			or any other error.
+	//			If non-nil, functionCode and payload are ignored and a
+	//			negative modbus response is sent back, with the exception
+	//			code set depending on the error. ErrProtocolError closes
+	//			the connection without a response.
+	//
+	// Responses violating these rules are replaced by a server device
+	// failure exception.
+	HandleRaw(req *RawRequest) (functionCode uint8, payload []byte, err error)
+}
+
 // Modbus server object.
 type ModbusServer struct {
 	// Timeout sets the idle session timeout (client connections will
@@ -627,14 +666,39 @@ func (ms *ModbusServer) handleTransport(t transport, clientAddr string) {
 			res.payload = append(res.payload, asBytes(binary.BigEndian, quantity)...)
 
 		default:
+			rh, ok := ms.handler.(RawRequestHandler)
+
+			// without a raw handler, or for function codes outside the
+			// request range, reply with an illegal function exception
+			if !ok || req.functionCode == 0 || req.functionCode&0x80 != 0 {
+				err = ErrIllegalFunction
+				break
+			}
+
+			var functionCode uint8
+			var payload []byte
+
+			functionCode, payload, err = rh.HandleRaw(&RawRequest{
+				ClientAddr:   clientAddr,
+				UnitId:       req.unitId,
+				FunctionCode: req.functionCode,
+				Payload:      req.payload,
+			})
+			if err != nil {
+				break
+			}
+
+			if !validRawResponse(req.functionCode, functionCode, payload) {
+				ms.logger.Warningf("raw handler returned an invalid response for function code 0x%02x (function code 0x%02x, %d payload bytes)",
+					req.functionCode, functionCode, len(payload))
+				err = ErrServerDeviceFailure
+				break
+			}
+
 			res = &pdu{
-				// reply with the request target unit ID
-				unitId: req.unitId,
-				// set the error bit
-				functionCode: (0x80 | req.functionCode),
-				// set the exception code to illegal function to indicate that
-				// the server does not know how to handle this function code.
-				payload: []byte{exIllegalFunction},
+				unitId:       req.unitId,
+				functionCode: functionCode,
+				payload:      payload,
 			}
 		}
 
@@ -666,5 +730,19 @@ func (ms *ModbusServer) handleTransport(t transport, clientAddr string) {
 		if err := t.WriteResponse(res); err != nil {
 			ms.logger.Warningf("failed to write response: %v", err)
 		}
+	}
+}
+
+// validRawResponse reports whether a raw handler response matches the request
+// function code and the PDU size limits.
+func validRawResponse(reqFunctionCode, functionCode uint8, payload []byte) bool {
+	switch functionCode {
+	case reqFunctionCode:
+		return len(payload) <= maxPDUPayloadLength
+	case 0x80 | reqFunctionCode:
+		// exception responses carry exactly one exception code byte
+		return len(payload) == 1
+	default:
+		return false
 	}
 }
