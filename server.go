@@ -713,7 +713,7 @@ func (ms *ModbusServer) handleTransport(t transport, clientAddr string) {
 		// map go errors to modbus errors, unless the error is a protocol error,
 		// in which case close the transport and return.
 		if err != nil {
-			if err == ErrProtocolError {
+			if errors.Is(err, ErrProtocolError) {
 				ms.logger.Warningf("protocol error, closing link (client address: '%s')", clientAddr)
 				t.Close()
 				return

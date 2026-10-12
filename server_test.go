@@ -658,6 +658,8 @@ func TestTCPServerRawFunctionCodes(t *testing.T) {
 		{"oversized payload", req, newRawTestHandler(append(maxPayload, 0xaa), nil), []byte{0xc1, exServerDeviceFailure}},
 		{"handler error mapped to exception", req, newRawTestHandler(nil, ErrGWTargetFailedToRespond),
 			[]byte{0xc1, exGWTargetFailedToRespond}},
+		{"wrapped handler error mapped to exception", req, newRawTestHandler(nil, fmt.Errorf("downstream: %w", ErrGWTargetFailedToRespond)),
+			[]byte{0xc1, exGWTargetFailedToRespond}},
 		// Huawei permission denied
 		{"vendor exception code passed through", req, newRawTestHandler(nil, ExceptionError(0x80)), []byte{0xc1, 0x80}},
 		{"wrapped exception code passed through", req, newRawTestHandler(nil, fmt.Errorf("downstream: %w", ExceptionError(0x80))),
@@ -717,6 +719,45 @@ func TestTCPServerRawFunctionCodes(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestTCPServerWrappedProtocolError(t *testing.T) {
+	// a wrapped protocol error closes the connection without a response
+	server, err := New(newRawTestHandler(nil, fmt.Errorf("downstream: %w", ErrProtocolError)))
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+
+	if err := server.Start(l); err != nil {
+		t.Fatalf("failed to start server: %v", err)
+	}
+	defer server.Stop()
+
+	conn, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	if err := conn.SetDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Huawei start file upload for unit id 16
+	if _, err := conn.Write([]byte{0x12, 0x34, 0x00, 0x00, 0x00, 0x05, 16, 0x41, 0x05, 0x01, 0x45}); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := conn.Read(make([]byte, 7))
+	if ne, ok := err.(net.Error); err == nil || ok && ne.Timeout() {
+		t.Errorf("expected the connection to be closed, got %d bytes, err: %v", n, err)
 	}
 }
 
@@ -783,13 +824,18 @@ func (th *rawTestHandler) HandleRaw(req *RawRequest) ([]byte, error) {
 }
 
 func TestExceptionCodeMapping(t *testing.T) {
-	// predefined codes map to their Error, all others to an ExceptionError
+	// predefined codes map to their Error, all others to an ExceptionError,
+	// both are mapped back the same way when wrapped
 	for _, code := range []uint8{
 		exIllegalFunction, exIllegalDataAddress, exIllegalDataValue, exServerDeviceFailure, exAcknowledge,
 		exServerDeviceBusy, 0x07, exMemoryParityError, exGWPathUnavailable, exGWTargetFailedToRespond, 0x80, 0xff,
 	} {
-		if res := mapErrorToExceptionCode(MapExceptionCodeToError(code)); res != code {
+		err := MapExceptionCodeToError(code)
+		if res := mapErrorToExceptionCode(err); res != code {
 			t.Errorf("exception code 0x%02x mapped to 0x%02x", code, res)
+		}
+		if res := mapErrorToExceptionCode(fmt.Errorf("wrapped: %w", err)); res != code {
+			t.Errorf("wrapped exception code 0x%02x mapped to 0x%02x", code, res)
 		}
 	}
 

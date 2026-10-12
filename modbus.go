@@ -120,24 +120,25 @@ func mapErrorToExceptionCode(err error) (exceptionCode uint8) {
 		return uint8(ee)
 	}
 
-	switch err {
-	case ErrIllegalFunction:
+	// predefined errors are matched like ExceptionError, also when wrapped
+	switch {
+	case errors.Is(err, ErrIllegalFunction):
 		exceptionCode = exIllegalFunction
-	case ErrIllegalDataAddress:
+	case errors.Is(err, ErrIllegalDataAddress):
 		exceptionCode = exIllegalDataAddress
-	case ErrIllegalDataValue:
+	case errors.Is(err, ErrIllegalDataValue):
 		exceptionCode = exIllegalDataValue
-	case ErrServerDeviceFailure:
+	case errors.Is(err, ErrServerDeviceFailure):
 		exceptionCode = exServerDeviceFailure
-	case ErrAcknowledge:
+	case errors.Is(err, ErrAcknowledge):
 		exceptionCode = exAcknowledge
-	case ErrMemoryParityError:
+	case errors.Is(err, ErrMemoryParityError):
 		exceptionCode = exMemoryParityError
-	case ErrServerDeviceBusy:
+	case errors.Is(err, ErrServerDeviceBusy):
 		exceptionCode = exServerDeviceBusy
-	case ErrGWPathUnavailable:
+	case errors.Is(err, ErrGWPathUnavailable):
 		exceptionCode = exGWPathUnavailable
-	case ErrGWTargetFailedToRespond:
+	case errors.Is(err, ErrGWTargetFailedToRespond):
 		exceptionCode = exGWTargetFailedToRespond
 	default:
 		exceptionCode = exServerDeviceFailure
