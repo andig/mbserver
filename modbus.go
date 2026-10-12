@@ -1,6 +1,9 @@
 package mbserver
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
 
 // maximum PDU size (253 bytes) minus the function code
 const maxPDUPayloadLength int = 252
@@ -17,6 +20,17 @@ type Error string
 func (me Error) Error() (s string) {
 	s = string(me)
 	return
+}
+
+// ExceptionError is a modbus exception code, e.g. a vendor specific one
+// without a predefined Error. Handlers may return it to send the exception
+// code unchanged. ExceptionError(0) is not a valid exception code and is
+// sent as a server device failure.
+type ExceptionError uint8
+
+// Error implements the error interface.
+func (ee ExceptionError) Error() string {
+	return fmt.Sprintf("exception code 0x%02x", uint8(ee))
 }
 
 const (
@@ -70,6 +84,7 @@ const (
 )
 
 // MapExceptionCodeToError turns a modbus exception code into a higher level Error object.
+// Codes without a predefined Error are returned as ExceptionError.
 func MapExceptionCodeToError(exceptionCode uint8) (err error) {
 	switch exceptionCode {
 	case exIllegalFunction:
@@ -91,7 +106,7 @@ func MapExceptionCodeToError(exceptionCode uint8) (err error) {
 	case exGWTargetFailedToRespond:
 		err = ErrGWTargetFailedToRespond
 	default:
-		err = fmt.Errorf("unknown exception code (%v)", exceptionCode)
+		err = ExceptionError(exceptionCode)
 	}
 
 	return
@@ -99,6 +114,12 @@ func MapExceptionCodeToError(exceptionCode uint8) (err error) {
 
 // mapErrorToExceptionCode turns an Error object into a modbus exception code.
 func mapErrorToExceptionCode(err error) (exceptionCode uint8) {
+	// an ExceptionError carries the exception code itself
+	var ee ExceptionError
+	if errors.As(err, &ee) && ee != 0 {
+		return uint8(ee)
+	}
+
 	switch err {
 	case ErrIllegalFunction:
 		exceptionCode = exIllegalFunction

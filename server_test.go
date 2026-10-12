@@ -651,17 +651,18 @@ func TestTCPServerRawFunctionCodes(t *testing.T) {
 
 	tcs := []testCase{
 		{"rejected without raw handler", req, &tcpTestHandler{}, []byte{0xc1, exIllegalFunction}},
-		{"forwarded", req, newRawTestHandler(0x41, []byte{0x05, 0x06, 0x00, 0x00, 0x01, 0x00, 0xfa}, nil),
+		{"forwarded", req, newRawTestHandler([]byte{0x05, 0x06, 0x00, 0x00, 0x01, 0x00, 0xfa}, nil),
 			[]byte{0x41, 0x05, 0x06, 0x00, 0x00, 0x01, 0x00, 0xfa}},
-		{"empty payload forwarded", req, newRawTestHandler(0x41, nil, nil), []byte{0x41}},
-		{"maximum payload forwarded", req, newRawTestHandler(0x41, maxPayload, nil), append([]byte{0x41}, maxPayload...)},
-		{"exception response passed through", req, newRawTestHandler(0xc1, []byte{0x80}, nil), []byte{0xc1, 0x80}},
-		{"handler error mapped to exception", req, newRawTestHandler(0, nil, ErrGWTargetFailedToRespond),
+		{"empty payload forwarded", req, newRawTestHandler(nil, nil), []byte{0x41}},
+		{"maximum payload forwarded", req, newRawTestHandler(maxPayload, nil), append([]byte{0x41}, maxPayload...)},
+		{"oversized payload", req, newRawTestHandler(append(maxPayload, 0xaa), nil), []byte{0xc1, exServerDeviceFailure}},
+		{"handler error mapped to exception", req, newRawTestHandler(nil, ErrGWTargetFailedToRespond),
 			[]byte{0xc1, exGWTargetFailedToRespond}},
-		{"mismatched response function code", req, newRawTestHandler(0x03, []byte{0x00}, nil), []byte{0xc1, exServerDeviceFailure}},
-		{"oversized payload", req, newRawTestHandler(0x41, append(maxPayload, 0xaa), nil), []byte{0xc1, exServerDeviceFailure}},
-		{"empty exception payload", req, newRawTestHandler(0xc1, nil, nil), []byte{0xc1, exServerDeviceFailure}},
-		{"exception payload too long", req, newRawTestHandler(0xc1, []byte{0x80, 0x00}, nil), []byte{0xc1, exServerDeviceFailure}},
+		// Huawei permission denied
+		{"vendor exception code passed through", req, newRawTestHandler(nil, ExceptionError(0x80)), []byte{0xc1, 0x80}},
+		{"wrapped exception code passed through", req, newRawTestHandler(nil, fmt.Errorf("downstream: %w", ExceptionError(0x80))),
+			[]byte{0xc1, 0x80}},
+		{"zero exception code", req, newRawTestHandler(nil, ExceptionError(0)), []byte{0xc1, exServerDeviceFailure}},
 	}
 
 	// function codes outside the request range must not reach the handler
@@ -669,7 +670,7 @@ func TestTCPServerRawFunctionCodes(t *testing.T) {
 		tcs = append(tcs, testCase{
 			fmt.Sprintf("invalid function code 0x%02x", fc),
 			append([]byte{fc}, req[1:]...),
-			newRawTestHandler(fc, nil, nil),
+			newRawTestHandler(nil, nil),
 			[]byte{0x80 | fc, exIllegalFunction},
 		})
 	}
@@ -759,24 +760,44 @@ func rawExchange(t *testing.T, addr string, unitId uint8, req []byte) []byte {
 	return res
 }
 
+var _ RawRequestHandler = (*rawTestHandler)(nil)
+
 type rawTestHandler struct {
 	tcpTestHandler
-	reqs         chan *RawRequest
-	functionCode uint8
-	payload      []byte
-	err          error
+	reqs    chan *RawRequest
+	payload []byte
+	err     error
 }
 
-func newRawTestHandler(functionCode uint8, payload []byte, err error) *rawTestHandler {
+func newRawTestHandler(payload []byte, err error) *rawTestHandler {
 	return &rawTestHandler{
-		reqs:         make(chan *RawRequest, 1),
-		functionCode: functionCode,
-		payload:      payload,
-		err:          err,
+		reqs:    make(chan *RawRequest, 1),
+		payload: payload,
+		err:     err,
 	}
 }
 
-func (th *rawTestHandler) HandleRaw(req *RawRequest) (uint8, []byte, error) {
+func (th *rawTestHandler) HandleRaw(req *RawRequest) ([]byte, error) {
 	th.reqs <- req
-	return th.functionCode, th.payload, th.err
+	return th.payload, th.err
+}
+
+func TestExceptionCodeMapping(t *testing.T) {
+	// predefined codes map to their Error, all others to an ExceptionError
+	for _, code := range []uint8{
+		exIllegalFunction, exIllegalDataAddress, exIllegalDataValue, exServerDeviceFailure, exAcknowledge,
+		exServerDeviceBusy, 0x07, exMemoryParityError, exGWPathUnavailable, exGWTargetFailedToRespond, 0x80, 0xff,
+	} {
+		if res := mapErrorToExceptionCode(MapExceptionCodeToError(code)); res != code {
+			t.Errorf("exception code 0x%02x mapped to 0x%02x", code, res)
+		}
+	}
+
+	if err := MapExceptionCodeToError(0x80); err != ExceptionError(0x80) {
+		t.Errorf("expected ExceptionError(0x80), got: %v", err)
+	}
+
+	if res := mapErrorToExceptionCode(ExceptionError(0)); res != exServerDeviceFailure {
+		t.Errorf("expected server device failure for exception code 0, got 0x%02x", res)
+	}
 }
