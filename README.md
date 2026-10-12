@@ -9,6 +9,8 @@ The main changes are:
 - added an `Option` interface to creating the server
 - added a `DummyHandler`
 - removed modbus client (use [github.com/grid-x/modbus](https://github.com/grid-x/modbus))
+- added an optional `RawRequestHandler` to forward function codes the server doesn't handle itself
+- added `ExceptionError` to send any exception code, including vendor specific ones
 
 ### Description
 

@@ -107,6 +107,46 @@ type RequestHandler interface {
 	HandleInputRegisters(*InputRegistersRequest) ([]uint16, error)
 }
 
+// Request object passed to the raw handler.
+type RawRequest struct {
+	ClientAddr   string // the source (client) IP address
+	UnitId       uint8  // the requested unit id (slave id)
+	FunctionCode uint8  // the function code of the request
+	Payload      []byte // the request PDU without the function code
+}
+
+// The RawRequestHandler interface may optionally be implemented by the
+// handler object passed to New(), in addition to RequestHandler.
+// Requests with function codes the server does not handle itself are then
+// passed to HandleRaw instead of being rejected with an illegal function
+// exception. This allows forwarding vendor specific function codes to a
+// downstream device.
+type RawRequestHandler interface {
+	// HandleRaw handles requests with function codes not covered by
+	// RequestHandler, within the valid request range 0x01 to 0x7f.
+	// A RawRequest object is passed to the handler (see above).
+	//
+	// Like the other handler methods, HandleRaw is called concurrently for
+	// different client connections, while requests on the same connection
+	// are handled one at a time. Implementations sharing a downstream
+	// connection must synchronize access to it.
+	//
+	// Expected return values:
+	// - res:	the response PDU without the function code, at most 252
+	//		bytes. Longer responses are replaced by a server device
+	//		failure exception.
+	// - err:	either nil if no error occurred, a modbus error (see
+	//		mapErrorToExceptionCode() in modbus.go for a complete list),
+	//		an ExceptionError to send a specific exception code, or any
+	//		other error.
+	//		If nil, a positive modbus response is sent back to the client
+	//		along with the returned data.
+	//		If non-nil, a negative modbus response is sent back, with the
+	//		exception code set depending on the error. ErrProtocolError
+	//		closes the connection without a response.
+	HandleRaw(*RawRequest) ([]byte, error)
+}
+
 // Modbus server object.
 type ModbusServer struct {
 	// Timeout sets the idle session timeout (client connections will
@@ -627,14 +667,38 @@ func (ms *ModbusServer) handleTransport(t transport, clientAddr string) {
 			res.payload = append(res.payload, asBytes(binary.BigEndian, quantity)...)
 
 		default:
+			rh, ok := ms.handler.(RawRequestHandler)
+
+			// without a raw handler, or for function codes outside the
+			// request range, reply with an illegal function exception
+			if !ok || req.functionCode == 0 || req.functionCode&0x80 != 0 {
+				err = ErrIllegalFunction
+				break
+			}
+
+			var payload []byte
+
+			payload, err = rh.HandleRaw(&RawRequest{
+				ClientAddr:   clientAddr,
+				UnitId:       req.unitId,
+				FunctionCode: req.functionCode,
+				Payload:      req.payload,
+			})
+			if err != nil {
+				break
+			}
+
+			if len(payload) > maxPDUPayloadLength {
+				ms.logger.Warningf("raw handler returned %d payload bytes for function code 0x%02x, exceeding the limit of %d",
+					len(payload), req.functionCode, maxPDUPayloadLength)
+				err = ErrServerDeviceFailure
+				break
+			}
+
 			res = &pdu{
-				// reply with the request target unit ID
-				unitId: req.unitId,
-				// set the error bit
-				functionCode: (0x80 | req.functionCode),
-				// set the exception code to illegal function to indicate that
-				// the server does not know how to handle this function code.
-				payload: []byte{exIllegalFunction},
+				unitId:       req.unitId,
+				functionCode: req.functionCode,
+				payload:      payload,
 			}
 		}
 
@@ -649,7 +713,7 @@ func (ms *ModbusServer) handleTransport(t transport, clientAddr string) {
 		// map go errors to modbus errors, unless the error is a protocol error,
 		// in which case close the transport and return.
 		if err != nil {
-			if err == ErrProtocolError {
+			if errors.Is(err, ErrProtocolError) {
 				ms.logger.Warningf("protocol error, closing link (client address: '%s')", clientAddr)
 				t.Close()
 				return

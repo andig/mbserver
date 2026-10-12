@@ -1,6 +1,10 @@
 package mbserver
 
 import (
+	"bytes"
+	"encoding/binary"
+	"fmt"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -630,4 +634,216 @@ func (th *tcpTestHandler) HandleInputRegisters(req *InputRegistersRequest) (res 
 	}
 
 	return
+}
+
+func TestTCPServerRawFunctionCodes(t *testing.T) {
+	// Huawei start file upload: function code 0x41, sub function 0x05, data length 1, file type 0x45
+	req := []byte{0x41, 0x05, 0x01, 0x45}
+
+	maxPayload := bytes.Repeat([]byte{0xaa}, maxPDUPayloadLength)
+
+	type testCase struct {
+		name    string
+		req     []byte // request PDU
+		handler RequestHandler
+		res     []byte // expected response PDU
+	}
+
+	tcs := []testCase{
+		{"rejected without raw handler", req, &tcpTestHandler{}, []byte{0xc1, exIllegalFunction}},
+		{"forwarded", req, newRawTestHandler([]byte{0x05, 0x06, 0x00, 0x00, 0x01, 0x00, 0xfa}, nil),
+			[]byte{0x41, 0x05, 0x06, 0x00, 0x00, 0x01, 0x00, 0xfa}},
+		{"empty payload forwarded", req, newRawTestHandler(nil, nil), []byte{0x41}},
+		{"maximum payload forwarded", req, newRawTestHandler(maxPayload, nil), append([]byte{0x41}, maxPayload...)},
+		{"oversized payload", req, newRawTestHandler(append(maxPayload, 0xaa), nil), []byte{0xc1, exServerDeviceFailure}},
+		{"handler error mapped to exception", req, newRawTestHandler(nil, ErrGWTargetFailedToRespond),
+			[]byte{0xc1, exGWTargetFailedToRespond}},
+		{"wrapped handler error mapped to exception", req, newRawTestHandler(nil, fmt.Errorf("downstream: %w", ErrGWTargetFailedToRespond)),
+			[]byte{0xc1, exGWTargetFailedToRespond}},
+		// Huawei permission denied
+		{"vendor exception code passed through", req, newRawTestHandler(nil, ExceptionError(0x80)), []byte{0xc1, 0x80}},
+		{"wrapped exception code passed through", req, newRawTestHandler(nil, fmt.Errorf("downstream: %w", ExceptionError(0x80))),
+			[]byte{0xc1, 0x80}},
+		{"zero exception code", req, newRawTestHandler(nil, ExceptionError(0)), []byte{0xc1, exServerDeviceFailure}},
+	}
+
+	// function codes outside the request range must not reach the handler
+	for _, fc := range []byte{0x00, 0x80, 0xc1, 0xff} {
+		tcs = append(tcs, testCase{
+			fmt.Sprintf("invalid function code 0x%02x", fc),
+			append([]byte{fc}, req[1:]...),
+			newRawTestHandler(nil, nil),
+			[]byte{0x80 | fc, exIllegalFunction},
+		})
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			server, err := New(tc.handler)
+			if err != nil {
+				t.Fatalf("failed to create server: %v", err)
+			}
+
+			l, err := net.Listen("tcp", ":0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer l.Close()
+
+			if err := server.Start(l); err != nil {
+				t.Fatalf("failed to start server: %v", err)
+			}
+			defer server.Stop()
+
+			res := rawExchange(t, l.Addr().String(), 16, tc.req)
+			if !bytes.Equal(res, tc.res) {
+				t.Errorf("expected response % x, got % x", tc.res, res)
+			}
+
+			rh, ok := tc.handler.(*rawTestHandler)
+			if !ok {
+				return
+			}
+
+			// the handler has run before the response was sent
+			select {
+			case r := <-rh.reqs:
+				if fc := tc.req[0]; fc == 0 || fc&0x80 != 0 {
+					t.Errorf("handler called for invalid function code: %+v", r)
+				} else if r.UnitId != 16 || r.FunctionCode != fc || !bytes.Equal(r.Payload, tc.req[1:]) {
+					t.Errorf("unexpected raw request: %+v", r)
+				}
+			default:
+				if fc := tc.req[0]; fc != 0 && fc&0x80 == 0 {
+					t.Error("raw handler was not called")
+				}
+			}
+		})
+	}
+}
+
+func TestTCPServerWrappedProtocolError(t *testing.T) {
+	// a wrapped protocol error closes the connection without a response
+	server, err := New(newRawTestHandler(nil, fmt.Errorf("downstream: %w", ErrProtocolError)))
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+
+	if err := server.Start(l); err != nil {
+		t.Fatalf("failed to start server: %v", err)
+	}
+	defer server.Stop()
+
+	conn, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	if err := conn.SetDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Huawei start file upload for unit id 16
+	if _, err := conn.Write([]byte{0x12, 0x34, 0x00, 0x00, 0x00, 0x05, 16, 0x41, 0x05, 0x01, 0x45}); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := conn.Read(make([]byte, 7))
+	if ne, ok := err.(net.Error); err == nil || ok && ne.Timeout() {
+		t.Errorf("expected the connection to be closed, got %d bytes, err: %v", n, err)
+	}
+}
+
+// rawExchange sends a single request PDU to the server and returns the response PDU.
+func rawExchange(t *testing.T, addr string, unitId uint8, req []byte) []byte {
+	t.Helper()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	if err := conn.SetDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	// MBAP header: transaction id, protocol id, length (unit id + PDU), unit id
+	length := len(req) + 1
+	frame := []byte{0x12, 0x34, 0x00, 0x00, byte(length >> 8), byte(length), unitId}
+	if _, err := conn.Write(append(frame, req...)); err != nil {
+		t.Fatal(err)
+	}
+
+	header := make([]byte, 7)
+	if _, err := io.ReadFull(conn, header); err != nil {
+		t.Fatal(err)
+	}
+	// length covers unit id, function code and payload
+	resLength := binary.BigEndian.Uint16(header[4:6])
+	if header[0] != 0x12 || header[1] != 0x34 || header[2] != 0 || header[3] != 0 || header[6] != unitId ||
+		resLength < 2 || resLength > 2+uint16(maxPDUPayloadLength) {
+		t.Fatalf("unexpected response header % x", header)
+	}
+
+	res := make([]byte, resLength-1)
+	if _, err := io.ReadFull(conn, res); err != nil {
+		t.Fatal(err)
+	}
+
+	return res
+}
+
+var _ RawRequestHandler = (*rawTestHandler)(nil)
+
+type rawTestHandler struct {
+	tcpTestHandler
+	reqs    chan *RawRequest
+	payload []byte
+	err     error
+}
+
+func newRawTestHandler(payload []byte, err error) *rawTestHandler {
+	return &rawTestHandler{
+		reqs:    make(chan *RawRequest, 1),
+		payload: payload,
+		err:     err,
+	}
+}
+
+func (th *rawTestHandler) HandleRaw(req *RawRequest) ([]byte, error) {
+	th.reqs <- req
+	return th.payload, th.err
+}
+
+func TestExceptionCodeMapping(t *testing.T) {
+	// predefined codes map to their Error, all others to an ExceptionError,
+	// both are mapped back the same way when wrapped
+	for _, code := range []uint8{
+		exIllegalFunction, exIllegalDataAddress, exIllegalDataValue, exServerDeviceFailure, exAcknowledge,
+		exServerDeviceBusy, 0x07, exMemoryParityError, exGWPathUnavailable, exGWTargetFailedToRespond, 0x80, 0xff,
+	} {
+		err := MapExceptionCodeToError(code)
+		if res := mapErrorToExceptionCode(err); res != code {
+			t.Errorf("exception code 0x%02x mapped to 0x%02x", code, res)
+		}
+		if res := mapErrorToExceptionCode(fmt.Errorf("wrapped: %w", err)); res != code {
+			t.Errorf("wrapped exception code 0x%02x mapped to 0x%02x", code, res)
+		}
+	}
+
+	if err := MapExceptionCodeToError(0x80); err != ExceptionError(0x80) {
+		t.Errorf("expected ExceptionError(0x80), got: %v", err)
+	}
+
+	if res := mapErrorToExceptionCode(ExceptionError(0)); res != exServerDeviceFailure {
+		t.Errorf("expected server device failure for exception code 0, got 0x%02x", res)
+	}
 }
